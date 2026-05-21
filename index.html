@@ -10,9 +10,11 @@
         :root { --primary: #ffcc00; --bg: #121212; --card-bg: #1e1e1e; --text: #ffffff; }
         body { background-color: #2c2c2c; color: var(--text); font-family: 'Segoe UI', Roboto, sans-serif; margin: 0; padding-bottom: 120px; transition: background-color 0.5s ease; overflow-x: hidden; }
 
-        /* Notification Chat flottante */
-        #floating-chat-notif { position: fixed; left: -300px; top: 100px; width: 280px; background: #333; border-left: 5px solid var(--primary); padding: 15px; z-index: 8000; border-radius: 0 10px 10px 0; box-shadow: 2px 2px 10px rgba(0,0,0,0.5); transition: left 0.5s ease; }
+        /* Notification Chat flottante avec onglet jaune visible */
+        #floating-chat-notif { position: fixed; left: -280px; top: 120px; width: 280px; background: #333; padding: 15px; z-index: 8000; border-radius: 0 10px 10px 0; box-shadow: 2px 2px 10px rgba(0,0,0,0.5); transition: left 0.3s ease; box-sizing: border-box; }
         #floating-chat-notif.active { left: 0; }
+        #floating-notif-handle { position: absolute; right: -40px; top: 0; width: 40px; height: 50px; background: var(--primary); color: #000; display: none; align-items: center; justify-content: center; flex-direction: column; font-weight: bold; border-radius: 0 8px 8px 0; cursor: pointer; box-shadow: 3px 2px 5px rgba(0,0,0,0.3); font-size: 1.1rem; }
+        #notif-badge { font-size: 0.7rem; background: red; color: white; border-radius: 50%; padding: 1px 5px; margin-top: 2px; display: none; }
 
         /* Écran de chargement */
         #loading-screen { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 9999; }
@@ -91,16 +93,14 @@
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#ffcc00">
 <link rel="apple-touch-icon" href="icon.png">
-
-<link rel="manifest" href="manifest.json">
-<meta name="theme-color" content="#4b6cb7">
-<link rel="apple-touch-icon" href="icon.png"></head>
+</head>
 <body>
 
-    <div id="floating-chat-notif">
-        <b id="notif-sender" style="color:var(--primary)"></b>
-        <p id="notif-text" style="font-size:0.9rem; margin:10px 0"></p>
-        <button class="btn-pro-header" style="width:100%" onclick="replyFromNotif()">RÉPONDRE</button>
+    <div id="floating-chat-notif" onclick="toggleFloatingNotif(event)">
+        <div id="floating-notif-handle">💬<span id="notif-badge">0</span></div>
+        <b id="notif-sender" style="color:var(--primary)">Nouveau message</b>
+        <div id="notif-text-container" style="max-height:120px; overflow-y:auto; margin:10px 0; font-size:0.9rem;"></div>
+        <button class="btn-pro-header" style="width:100%" onclick="replyFromNotif(event)">RÉPONDRE</button>
     </div>
 
     <div id="loading-screen">
@@ -281,7 +281,8 @@
         let clientOrderTracking = null;
         let currentChatOrderId = null;
         let currentChatPartner = null;
-        let lastKnownMsgCount = {};
+        let lastSeenMsgCount = {};
+        let pendingNotifData = null;
 
         function calcAvg(arr) { if(!arr || arr.length === 0) return "N/A"; const sum = arr.reduce((a, b) => a + b, 0); return (sum / arr.length).toFixed(1); }
 
@@ -305,26 +306,22 @@
 
         function bindCloudListeners() {
             db.ref('cloud_koul/restaurants').on('value', (snapshot) => { 
-                const oldRestaurants = restaurants;
                 restaurants = snapshot.val() || []; 
                 
-                // Detection nouveaux messages
-                restaurants.forEach(r => {
-                    if(r.orders) r.orders.forEach(o => {
-                        if(o.chatMessages) {
-                            const count = o.chatMessages.length;
-                            if(lastKnownMsgCount[o.id] && count > lastKnownMsgCount[o.id]) {
-                                const lastMsg = o.chatMessages[count-1];
-                                const amIClient = (clientOrderTracking && clientOrderTracking.some(t => t.orderId === o.id));
-                                const amILivreur = (currentLivreur && o.livId === currentLivreur.id);
-                                if((amIClient && lastMsg.sender === 'livreur') || (amILivreur && lastMsg.sender === 'client')) {
-                                    showFloatingNotif(amIClient ? "Livreur" : "Client", lastMsg.text, r.id, o.id, amIClient ? 'livreur' : 'client');
-                                }
-                            }
-                            lastKnownMsgCount[o.id] = count;
+                if (document.getElementById('chat-modal').style.display === 'flex' && currentChatOrderId) {
+                    let openOrder = null;
+                    restaurants.forEach(r => {
+                        if (r.orders) {
+                            let o = r.orders.find(ord => ord.id === currentChatOrderId);
+                            if (o) openOrder = o;
                         }
                     });
-                });
+                    if (openOrder && openOrder.chatMessages) {
+                        renderChatMessages(openOrder.chatMessages, currentChatPartner);
+                    }
+                }
+
+                updateFloatingNotifUI();
                 onRestaurantsUpdated(); 
             });
             db.ref('cloud_koul/livreurs').on('value', (snapshot) => { livreurs = snapshot.val() || []; onLivreursUpdated(); });
@@ -332,17 +329,65 @@
             db.ref('cloud_koul/promoMessage').on('value', (snapshot) => { promoMessage = snapshot.val() || 'BIENVENUE'; document.getElementById('notif-message').innerText = promoMessage; });
         }
 
-        let pendingNotifData = null;
-        function showFloatingNotif(sender, text, resId, orderId, type) {
-            pendingNotifData = {resId, orderId, type};
-            document.getElementById('notif-sender').innerText = "Nouveau message de " + sender;
-            document.getElementById('notif-text').innerText = text;
+        function updateFloatingNotifUI() {
+            let totalUnreadCount = 0;
+            let unreadMessagesTexts = [];
+            pendingNotifData = null;
+
+            restaurants.forEach(r => {
+                if(r.orders) r.orders.forEach(o => {
+                    if(o.chatMessages) {
+                        const totalMsgs = o.chatMessages.length;
+                        if (document.getElementById('chat-modal').style.display === 'flex' && currentChatOrderId === o.id) {
+                            lastSeenMsgCount[o.id] = totalMsgs;
+                        }
+                        const seenCount = lastSeenMsgCount[o.id] || 0;
+                        
+                        const amIClient = (clientOrderTracking && clientOrderTracking.some(t => t.orderId === o.id));
+                        const amILivreur = (currentLivreur && o.livId === currentLivreur.id);
+                        
+                        if (amIClient || amILivreur) {
+                            for (let i = seenCount; i < totalMsgs; i++) {
+                                const msg = o.chatMessages[i];
+                                if ((amIClient && msg.sender === 'livreur') || (amILivreur && msg.sender === 'client')) {
+                                    totalUnreadCount++;
+                                    unreadMessagesTexts.push(`<div style="margin-bottom: 5px;"><b>${msg.sender === 'livreur' ? 'Livreur' : 'Client'}:</b> ${msg.text}</div>`);
+                                    if (!pendingNotifData) {
+                                        pendingNotifData = { resId: r.id, orderId: o.id, type: amIClient ? 'livreur' : 'client' };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+
+            const handle = document.getElementById('floating-notif-handle');
+            const badge = document.getElementById('notif-badge');
+            const textCont = document.getElementById('notif-text-container');
+            const senderEl = document.getElementById('notif-sender');
             const el = document.getElementById('floating-chat-notif');
-            el.classList.add('active');
-            vibrate(500);
-            setTimeout(() => el.classList.remove('active'), 8000);
+
+            if (totalUnreadCount > 0) {
+                handle.style.display = 'flex';
+                badge.style.display = 'inline-block';
+                badge.innerText = totalUnreadCount;
+                senderEl.innerText = `${totalUnreadCount} non lu(s)`;
+                textCont.innerHTML = unreadMessagesTexts.join('');
+            } else {
+                handle.style.display = 'none';
+                badge.style.display = 'none';
+                el.classList.remove('active');
+            }
         }
-        function replyFromNotif() {
+
+        function toggleFloatingNotif(event) {
+            if (event.target.tagName === 'BUTTON') return;
+            document.getElementById('floating-chat-notif').classList.toggle('active');
+        }
+
+        function replyFromNotif(event) {
+            if (event) event.stopPropagation();
             if(pendingNotifData) {
                 openChatModal(pendingNotifData.resId, pendingNotifData.orderId, pendingNotifData.type);
                 document.getElementById('floating-chat-notif').classList.remove('active');
@@ -525,7 +570,7 @@
             });
         }
 
-        function deleteRes(id) { id = Number(id); const r = restaurants.find(x => Number(x.id) === id); if(confirm("Supprimer ce restaurant ?")) { logAdminEvent("SYSTEM", `Resto supprimé: ${r.name}`); restaurants = restaurants.filter(x => Number(x.id) !== id); pushRestaurants(); renderAdminResList(); } }
+        function deleteRes(id) { id = Number(id); const r = restaurants.find(x => Number(x.id) !== id); if(confirm("Supprimer ce restaurant ?")) { logAdminEvent("SYSTEM", `Resto supprimé: ${r.name}`); restaurants = restaurants.filter(x => Number(x.id) !== id); pushRestaurants(); renderAdminResList(); } }
 
         function renderAdminLivList() { 
             const l = document.getElementById('list-liv-to-manage');
@@ -855,11 +900,18 @@
             }
             
             if(!o.chatMessages) o.chatMessages = [];
+            lastSeenMsgCount[orderId] = o.chatMessages.length;
             renderChatMessages(o.chatMessages, partnerType);
+            updateFloatingNotifUI();
             modal.style.display = 'flex';
         }
         
-        function closeChatModal() { document.getElementById('chat-modal').style.display = 'none'; currentChatOrderId = null; currentChatPartner = null; }
+        function closeChatModal() { 
+            document.getElementById('chat-modal').style.display = 'none'; 
+            currentChatOrderId = null; 
+            currentChatPartner = null; 
+            updateFloatingNotifUI();
+        }
         
         function renderChatMessages(messages, partnerType) {
             const messagesDiv = document.getElementById('chat-messages');
@@ -884,8 +936,10 @@
             const o = targetRes.orders.find(x => x.id === currentChatOrderId);
             if(!o.chatMessages) o.chatMessages = [];
             o.chatMessages.push({ sender: currentChatPartner === 'livreur' ? 'client' : 'livreur', text: text, timestamp: Date.now() });
+            lastSeenMsgCount[currentChatOrderId] = o.chatMessages.length;
             input.value = '';
             renderChatMessages(o.chatMessages, currentChatPartner);
+            updateFloatingNotifUI();
             saveRestaurant(targetRes);
         }
         
@@ -901,7 +955,5 @@
         loadClientOrderTracking(); bindCloudListeners(); init();
     </script>
 <script>if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js'));}</script>
-
-<script>if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js'));}</script>
-</body>
+<div id="update-banner" style="display:none; position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#23272d; color:white; padding:15px; border-radius:12px; z-index:9999; text-align:center; border:1px solid #4b6cb7;">Une mise à jour est disponible ! <button onclick="onUpdateClick()" style="margin-left:10px; cursor:pointer; background:#4b6cb7; color:white; border:none; padding:5px 10px; border-radius:5px;">Installer</button></div><script>let newWorker;if('serviceWorker' in navigator){navigator.serviceWorker.register('./sw.js').then(reg=>{if(reg.waiting){newWorker=reg.waiting;document.getElementById('update-banner').style.display='block';}reg.addEventListener('updatefound',()=>{newWorker=reg.installing;newWorker.addEventListener('statechange',()=>{if(newWorker.state==='installed'&&navigator.serviceWorker.controller)document.getElementById('update-banner').style.display='block';});});});navigator.serviceWorker.addEventListener('controllerchange',()=>{window.location.reload();});}function onUpdateClick(){if(newWorker)newWorker.postMessage({type:'SKIP_WAITING'});}</script></body>
 </html>
